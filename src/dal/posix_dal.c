@@ -79,6 +79,8 @@ GNU licenses can be found at http://www.gnu.org/licenses/.
 #include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/types.h>
+#include <attr/xattr.h>
 
 //   -------------    POSIX DEFINITIONS    -------------
 
@@ -86,7 +88,6 @@ GNU licenses can be found at http://www.gnu.org/licenses/.
 #define SFX_PADDING 14         // number of extra chars required to fit any suffix combo
 #define WRITE_SFX ".partial"   // 8 characters
 #define REBUILD_SFX ".rebuild" // 8 characters
-#define META_SFX ".meta"       // 5 characters (in ADDITION to other suffixes!)
 
 #define IO_SIZE 1048576 // Preferred I/O Size
 
@@ -100,7 +101,6 @@ GNU licenses can be found at http://www.gnu.org/licenses/.
 typedef struct posix_block_context_struct
 {
    int fd;         // File Descriptor (if open)
-   int mfd;        // Meta File Descriptor (if open)
    int sfd;        // Secure Root File Descriptor (if open)
    char *filepath; // File Path (if open)
    int filelen;    // Length of filepath string
@@ -447,52 +447,9 @@ static int block_delete(POSIX_BLOCK_CTXT bctxt, char components)
    {
       working_suffix = REBUILD_SFX;
    }
-   // append the meta suffix and check for success
-   char *res = strncat(bctxt->filepath + bctxt->filelen, META_SFX, SFX_PADDING);
-   if (res != (bctxt->filepath + bctxt->filelen))
-   {
-      LOG(LOG_ERR, "failed to append meta suffix \"%s\" to file path \"%s\"!\n", META_SFX, bctxt->filepath);
-      errno = EBADF;
-      return -1;
-   }
-
-   int metalen = strlen(META_SFX);
-
-   // append the working suffix and check for success
-   res = strncat(bctxt->filepath + bctxt->filelen + metalen, working_suffix, SFX_PADDING - metalen);
-   if (res != (bctxt->filepath + bctxt->filelen + metalen))
-   {
-      LOG(LOG_ERR, "failed to append working suffix \"%s\" to file path \"%s\"!\n", working_suffix, bctxt->filepath);
-      errno = EBADF;
-      *(bctxt->filepath + bctxt->filelen) = '\0'; // make sure no suffix remains
-      return -1;
-   }
-
-   // unlink any in-progress meta file (only failure with ENOENT is acceptable)
-   if (unlinkat(bctxt->sfd, bctxt->filepath, 0) != 0 && errno != ENOENT)
-   {
-      LOG(LOG_ERR, "failed to unlink \"%s\" (%s)\n", bctxt->filepath, strerror(errno));
-      *(bctxt->filepath + bctxt->filelen) = '\0'; // make sure no suffix remains
-      return -1;
-   }
-
-   // trim the working suffix off
-   *(bctxt->filepath + bctxt->filelen + metalen) = '\0';
-
-   if (components)
-   {
-      // unlink any meta file (only failure with ENOENT is acceptable)
-      if (unlinkat(bctxt->sfd, bctxt->filepath, 0) != 0 && errno != ENOENT)
-      {
-         LOG(LOG_ERR, "failed to unlink \"%s\" (%s)\n", bctxt->filepath, strerror(errno));
-         *(bctxt->filepath + bctxt->filelen) = '\0'; // make sure no suffix remains
-         return -1;
-      }
-   }
 
    // trim the meta suffix off and attach a working suffix in its place
-   *(bctxt->filepath + bctxt->filelen) = '\0';
-   res = strncat(bctxt->filepath + bctxt->filelen, working_suffix, SFX_PADDING - metalen);
+   char* res = strncat(bctxt->filepath + bctxt->filelen, working_suffix, SFX_PADDING);
    if (res != (bctxt->filepath + bctxt->filelen))
    {
       LOG(LOG_ERR, "failed to append working suffix \"%s\" to file path \"%s\"!\n", working_suffix, bctxt->filepath);
@@ -500,6 +457,7 @@ static int block_delete(POSIX_BLOCK_CTXT bctxt, char components)
       *(bctxt->filepath + bctxt->filelen) = '\0'; // make sure no suffix remains
       return -1;
    }
+   
 
    // unlink any in-progress data file (only failure with ENOENT is acceptable)
    if (unlinkat(bctxt->sfd, bctxt->filepath, 0) != 0 && errno != ENOENT)
@@ -855,17 +813,12 @@ int posix_set_meta_internal(BLOCK_CTXT ctxt, const char *meta_buf, size_t size)
       LOG(LOG_ERR, "received a NULL block context!\n");
       return -1;
    }
+
    POSIX_BLOCK_CTXT bctxt = (POSIX_BLOCK_CTXT)ctxt; // should have been passed a posix context
 
-   // reseek to the start of the sidecar file
-   if ( lseek( bctxt->mfd, 0, SEEK_SET ) ) {
-      LOG( LOG_ERR, "failed to reseek to start of meta file: \"%s\" (%s)\n", bctxt->filepath, strerror(errno) );
-      return -1;
-   }
-   // write the provided buffer out to the sidecar file
-   if (write(bctxt->mfd, meta_buf, size) != size)
-   {
-      LOG(LOG_ERR, "failed to write buffer to meta file: \"%s\" (%s)\n", bctxt->filepath, strerror(errno));
+   // set xattr of posix file
+   if ( fsetxattr(bctxt->fd, "user.DAL_meta", meta_buf, size, 0) ) {
+      LOG( LOG_ERR, "failed to set xattr of posix file: \"%s\" (%s)\n", bctxt->filepath, strerror(errno) );
       return -1;
    }
 
@@ -886,25 +839,17 @@ ssize_t posix_get_meta_internal(BLOCK_CTXT ctxt, char *meta_buf, size_t size)
       LOG(LOG_ERR, "received a NULL block context!\n");
       return -1;
    }
+
    POSIX_BLOCK_CTXT bctxt = (POSIX_BLOCK_CTXT)ctxt; // should have been passed a posix context
 
-   // reseek to the start of the sidecar file
-   if ( lseek( bctxt->mfd, 0, SEEK_SET ) ) {
-      LOG( LOG_ERR, "failed to reseek to start of meta file: \"%s\" (%s)\n", bctxt->filepath, strerror(errno) );
+   // fill meta_buf with xattr
+   ssize_t result = fgetxattr(bctxt->fd, "user.DAL_meta", meta_buf, size);
+
+   if (result == -1) {
+      LOG( LOG_ERR, "failed to get xattr from posix file: \"%s\" (%s)\n", bctxt->filepath, strerror(errno) );
       return -1;
    }
-   ssize_t result = read(bctxt->mfd, meta_buf, size);
-   // potentially indicate excess meta information
-   if ( result == size ) {
-      // we need to stat this sidecar file to get the total meta info length
-      struct stat stval;
-      if ( fstat(bctxt->mfd, &stval) ) {
-         LOG( LOG_ERR, "failed to stat meta file \"%s\" to check for possible excess meta length (%s)\n", bctxt->filepath, strerror(errno) );
-         return -1;
-      }
-      // increase result to match the total meta info size, if appropriate
-      if ( result < stval.st_size ) { result = stval.st_size; }
-   }
+
    return result;
 }
 
@@ -1302,61 +1247,7 @@ int posix_migrate(DAL_CTXT ctxt, const char *objID, DAL_location src, DAL_locati
    // permanently move object from old location to new location (link to dest loc and unlink src loc)
    if (offline)
    {
-      // append the meta suffix to the source and check for success
-      char *res = strncat(srcctxt->filepath + srcctxt->filelen, META_SFX, SFX_PADDING);
-      if (res != (srcctxt->filepath + srcctxt->filelen))
-      {
-         LOG(LOG_ERR, "failed to append meta suffix \"%s\" to source file path!\n", META_SFX);
-         errno = EBADF;
-         free(srcctxt->filepath);
-         free(srcctxt);
-         free(destctxt->filepath);
-         free(destctxt);
-         return -1;
-      }
-
-      // duplicate the source meta path and check for success
-      char *src_meta_path = strdup(srcctxt->filepath);
-      if (src_meta_path == NULL)
-      {
-         LOG(LOG_ERR, "failed to allocate space for a new source meta string! (%s)\n", strerror(errno));
-         *(srcctxt->filepath + srcctxt->filelen) = '\0'; // make sure no suffix remains
-         free(srcctxt->filepath);
-         free(srcctxt);
-         free(destctxt->filepath);
-         free(destctxt);
-         return -1;
-      }
-      *(srcctxt->filepath + srcctxt->filelen) = '\0'; // make sure no suffix remains
-
-      // append the meta suffix to the destination and check for success
-      res = strncat(destctxt->filepath + destctxt->filelen, META_SFX, SFX_PADDING);
-      if (res != (destctxt->filepath + destctxt->filelen))
-      {
-         LOG(LOG_ERR, "failed to append meta suffix \"%s\" to destination file path!\n", META_SFX);
-         errno = EBADF;
-         free(srcctxt->filepath);
-         free(srcctxt);
-         free(destctxt->filepath);
-         free(destctxt);
-         free(src_meta_path);
-         return -1;
-      }
-
-      // duplicate the destination meta path and check for success
-      char *dest_meta_path = strdup(destctxt->filepath);
-      if (dest_meta_path == NULL)
-      {
-         LOG(LOG_ERR, "failed to allocate space for a new destination meta string! (%s)\n", strerror(errno));
-         *(destctxt->filepath + destctxt->filelen) = '\0'; // make sure no suffix remains
-         free(srcctxt->filepath);
-         free(srcctxt);
-         free(destctxt->filepath);
-         free(destctxt);
-         free(src_meta_path);
-         return -1;
-      }
-      *(destctxt->filepath + destctxt->filelen) = '\0'; // make sure no suffix remains
+      int ret = 0;
 
       // attempt to link data and check for success
       if (linkat(dctxt->sec_root, srcctxt->filepath, dctxt->sec_root, destctxt->filepath, 0))
@@ -1366,54 +1257,21 @@ int posix_migrate(DAL_CTXT ctxt, const char *objID, DAL_location src, DAL_locati
          free(srcctxt);
          free(destctxt->filepath);
          free(destctxt);
-         free(src_meta_path);
-         free(dest_meta_path);
          return manual_migrate(dctxt, objID, src, dest);
-      }
-
-      int ret = 0;
-      // attempt to link meta and check for success
-      if (linkat(dctxt->sec_root, src_meta_path, dctxt->sec_root, dest_meta_path, 0))
-      {
-         LOG(LOG_ERR, "failed to link meta file \"%s\" to \"%s\" (%s)\n", src_meta_path, dest_meta_path, strerror(errno));
-         if (unlinkat(dctxt->sec_root, destctxt->filepath, 0))
-         {
-            ret = -2;
-         }
-         else
-         {
-            ret = manual_migrate(dctxt, objID, src, dest);
-         }
-         free(srcctxt->filepath);
-         free(srcctxt);
-         free(destctxt->filepath);
-         free(destctxt);
-         free(src_meta_path);
-         free(dest_meta_path);
-         return ret;
       }
 
       // attempt to unlink data and check for success
       if (unlinkat(dctxt->sec_root, srcctxt->filepath, 0))
       {
          LOG(LOG_ERR, "failed to unlink source data file \"%s\" (%s)\n", srcctxt->filepath, strerror(errno));
-         ret = 1;
+	 ret = 1;
       }
 
-      // attempt to unlink meta and check for success
-      if (unlinkat(dctxt->sec_root, src_meta_path, 0))
-      {
-         LOG(LOG_ERR, "failed to unlink source meta file \"%s\" to (%s)\n", src_meta_path, strerror(errno));
-         ret = 1;
-      }
-
-      free(src_meta_path);
-      free(dest_meta_path);
       free(srcctxt->filepath);
       free(srcctxt);
       free(destctxt->filepath);
       free(destctxt);
-      return ret;
+      return ret; // to maintain pre sidecar file functionality
    }
    // allow object to be accessed from both locations (symlink dest loc to src loc)
    else
@@ -1441,33 +1299,6 @@ int posix_migrate(DAL_CTXT ctxt, const char *objID, DAL_location src, DAL_locati
          return -1;
       }
 
-      // append the meta suffix and check for success
-      char *res = strncat(srcctxt->filepath + srcctxt->filelen, META_SFX, SFX_PADDING);
-      if (res != (srcctxt->filepath + srcctxt->filelen))
-      {
-         LOG(LOG_ERR, "failed to append meta suffix \"%s\" to source file path!\n", META_SFX);
-         errno = EBADF;
-         free(srcctxt->filepath);
-         free(srcctxt);
-         free(destctxt->filepath);
-         free(destctxt);
-         free(oldpath);
-         return -1;
-      }
-      res = strncat(destctxt->filepath + destctxt->filelen, META_SFX, SFX_PADDING);
-      if (res != (destctxt->filepath + destctxt->filelen))
-      {
-         LOG(LOG_ERR, "failed to append meta suffix \"%s\" to destination file path!\n", META_SFX);
-         errno = EBADF;
-         *(srcctxt->filepath + srcctxt->filelen) = '\0'; // make sure no suffix remains
-         free(srcctxt->filepath);
-         free(srcctxt);
-         free(destctxt->filepath);
-         free(destctxt);
-         free(oldpath);
-         return -1;
-      }
-
       free(oldpath);
       oldpath = convert_relative(srcctxt->filepath, destctxt->filepath);
       if (oldpath == NULL)
@@ -1479,7 +1310,7 @@ int posix_migrate(DAL_CTXT ctxt, const char *objID, DAL_location src, DAL_locati
          free(destctxt);
          return -1;
       }
-
+/*
       // attempt to symlink meta and check for success
       if (symlinkat(oldpath, dctxt->sec_root, destctxt->filepath))
       {
@@ -1493,7 +1324,7 @@ int posix_migrate(DAL_CTXT ctxt, const char *objID, DAL_location src, DAL_locati
          free(oldpath);
          return -1;
       }
-
+*/
       *(srcctxt->filepath + srcctxt->filelen) = '\0';   // make sure no suffix remains
       *(destctxt->filepath + destctxt->filelen) = '\0'; // make sure no suffix remains
       free(oldpath);
@@ -1616,19 +1447,6 @@ BLOCK_CTXT posix_open(DAL_CTXT ctxt, DAL_MODE mode, DAL_location location, const
 
    char *res = NULL;
 
-   // append the meta suffix and check for success
-   res = strncat(bctxt->filepath + bctxt->filelen, META_SFX, SFX_PADDING);
-   if (res != (bctxt->filepath + bctxt->filelen))
-   {
-      LOG(LOG_ERR, "failed to append meta suffix \"%s\" to file path!\n", META_SFX);
-      errno = EBADF;
-      free(bctxt->filepath);
-      free(bctxt);
-      return NULL;
-   }
-
-   int metalen = strlen(META_SFX);
-
    int oflags = O_WRONLY | O_CREAT | O_EXCL;
    if (mode == DAL_READ)
    {
@@ -1646,43 +1464,26 @@ BLOCK_CTXT posix_open(DAL_CTXT ctxt, DAL_MODE mode, DAL_location location, const
       // append the proper suffix and check for success
       if (mode == DAL_WRITE)
       {
-         res = strncat(bctxt->filepath + bctxt->filelen + metalen, WRITE_SFX, SFX_PADDING - metalen);
+         res = strncat(bctxt->filepath + bctxt->filelen, WRITE_SFX, SFX_PADDING);
       }
       else if (mode == DAL_REBUILD)
       {
-         res = strncat(bctxt->filepath + bctxt->filelen + metalen, REBUILD_SFX, SFX_PADDING - metalen);
+         res = strncat(bctxt->filepath + bctxt->filelen, REBUILD_SFX, SFX_PADDING);
       }
-      if (res != (bctxt->filepath + bctxt->filelen + metalen))
+      if (res != (bctxt->filepath + bctxt->filelen))
       {
-         LOG(LOG_ERR, "failed to append suffix to meta path!\n");
+         LOG(LOG_ERR, "failed to append mode suffix!\n");
          errno = EBADF;
          free(bctxt->filepath);
          free(bctxt);
          return NULL;
       }
-   }
+   } 
+   
 
-   // open the meta file and check for success
-   mode_t mask = umask(0);
-   bctxt->mfd = openat(dctxt->sec_root, bctxt->filepath, oflags | dctxt->metaflags, S_IRWXU | S_IRWXG | S_IRWXO); // mode arg should be harmlessly ignored if reading
-   if (bctxt->mfd < 0  &&  errno == EEXIST  &&  mode != DAL_READ  &&  mode != DAL_METAREAD ) {
-      // specifically for a write EEXIST error, unlink the dest path and retry once
-      unlinkat( dctxt->sec_root, bctxt->filepath, 0 ); // don't bother checking for this failure, only the open result matters
-      bctxt->mfd = openat(dctxt->sec_root, bctxt->filepath, oflags | dctxt->metaflags, S_IRWXU | S_IRWXG | S_IRWXO);
-   }
-   if (bctxt->mfd < 0)
-   {
-      LOG(LOG_ERR, "failed to open meta file: \"%s\" (%s)\n", bctxt->filepath, strerror(errno));
-      if (mode == DAL_METAREAD)
-      {
-         umask(mask);
-         free(bctxt->filepath);
-         free(bctxt);
-         return NULL;
-      }
-   }
    // remove any suffix in the simplest possible manner
    *(bctxt->filepath + bctxt->filelen) = '\0';
+   mode_t mask = umask(0);
 
    if (mode == DAL_WRITE || mode == DAL_REBUILD)
    {
@@ -1702,7 +1503,6 @@ BLOCK_CTXT posix_open(DAL_CTXT ctxt, DAL_MODE mode, DAL_location location, const
       {
          LOG(LOG_ERR, "failed to append suffix to file path!\n");
          errno = EBADF;
-         close(bctxt->mfd);
          umask(mask);
          free(bctxt->filepath);
          free(bctxt);
@@ -1710,25 +1510,22 @@ BLOCK_CTXT posix_open(DAL_CTXT ctxt, DAL_MODE mode, DAL_location location, const
       }
    }
 
-   if (mode != DAL_METAREAD)
-   {
-      // open the file and check for success
-      bctxt->fd = openat(dctxt->sec_root, bctxt->filepath, oflags | dctxt->dataflags, S_IRWXU | S_IRWXG | S_IRWXO); // mode arg should be harmlessly ignored if reading
-      if (bctxt->fd < 0  &&  errno == EEXIST  &&  mode != DAL_READ ) {
-         // specifically for a write EEXIST error, unlink the dest path and retry once
-         unlinkat( dctxt->sec_root, bctxt->filepath, 0 ); // don't bother checking for this failure, only the open result matters
-         bctxt->fd = openat(dctxt->sec_root, bctxt->filepath, oflags | dctxt->metaflags, S_IRWXU | S_IRWXG | S_IRWXO);
-      }
-      if (bctxt->fd < 0)
-      {
-         LOG(LOG_ERR, "failed to open file: \"%s\" (%s)\n", bctxt->filepath, strerror(errno));
-         close(bctxt->mfd);
-         umask(mask);
-         free(bctxt->filepath);
-         free(bctxt);
-         return NULL;
-      }
+   // open the file and check for success
+   bctxt->fd = openat(dctxt->sec_root, bctxt->filepath, oflags | dctxt->dataflags, S_IRWXU | S_IRWXG | S_IRWXO); // mode arg should be harmlessly ignored if reading
+   if (bctxt->fd < 0  &&  errno == EEXIST  &&  mode != DAL_READ ) {
+      // specifically for a write EEXIST error, unlink the dest path and retry once
+      unlinkat( dctxt->sec_root, bctxt->filepath, 0 ); // don't bother checking for this failure, only the open result matters
+      bctxt->fd = openat(dctxt->sec_root, bctxt->filepath, oflags | dctxt->metaflags, S_IRWXU | S_IRWXG | S_IRWXO);
    }
+   if (bctxt->fd < 0)
+   {
+      LOG(LOG_ERR, "failed to open file: \"%s\" (%s)\n", bctxt->filepath, strerror(errno));
+      umask(mask);
+      free(bctxt->filepath);
+      free(bctxt);
+      return NULL;
+   }
+   
    // remove any suffix in the simplest possible manner
    *(bctxt->filepath + bctxt->filelen) = '\0';
 
@@ -1815,10 +1612,6 @@ int posix_abort(BLOCK_CTXT ctxt)
    {
       LOG(LOG_WARNING, "failed to close data file \"%s\" during abort (%s)\n", bctxt->filepath, strerror(errno));
    }
-   if (close(bctxt->mfd) != 0)
-   {
-      LOG(LOG_WARNING, "failed to close meta file \"%s%s\" during abort (%s)\n", bctxt->filepath, META_SFX, strerror(errno));
-   }
 
    // free state
    free(bctxt->filepath);
@@ -1839,13 +1632,6 @@ int posix_close(BLOCK_CTXT ctxt)
    if ((bctxt->mode != DAL_METAREAD) && (close(bctxt->fd) != 0))
    {
       LOG(LOG_ERR, "failed to close data file \"%s\" (%s)\n", bctxt->filepath, strerror(errno));
-      return -1;
-   }
-
-   // attempt to close our meta FD and check for success
-   if (close(bctxt->mfd))
-   {
-      LOG(LOG_ERR, "failed to close meta file \"%s%s\" (%s)\n", bctxt->filepath, META_SFX, strerror(errno));
       return -1;
    }
 
@@ -1883,47 +1669,6 @@ int posix_close(BLOCK_CTXT ctxt)
          return -1;
       }
       free(write_path);
-
-      // append the meta suffix and check for success
-      res = strncat(bctxt->filepath + bctxt->filelen, META_SFX, SFX_PADDING);
-      if (res != (bctxt->filepath + bctxt->filelen))
-      {
-         LOG(LOG_ERR, "failed to append meta suffix \"%s\" to file path!\n", META_SFX);
-         errno = EBADF;
-         return -1;
-      }
-
-      int metalen = strlen(META_SFX);
-
-      // append the proper suffix and check for success
-      if (bctxt->mode == DAL_WRITE)
-      {
-         res = strncat(bctxt->filepath + bctxt->filelen + metalen, WRITE_SFX, SFX_PADDING - metalen);
-      }
-      if (bctxt->mode == DAL_REBUILD)
-      {
-         res = strncat(bctxt->filepath + bctxt->filelen + metalen, REBUILD_SFX, SFX_PADDING - metalen);
-      }
-      if (res != (bctxt->filepath + bctxt->filelen + metalen))
-      {
-         LOG(LOG_ERR, "failed to append write suffix \"%s\" to file path!\n", WRITE_SFX);
-         errno = EBADF;
-         *(bctxt->filepath + bctxt->filelen) = '\0'; // make sure no suffix remains
-         return -1;
-      }
-
-      // duplicate the path and check for success
-      char *meta_path = strdup(bctxt->filepath);
-      *(bctxt->filepath + bctxt->filelen + metalen) = '\0'; // make sure no suffix remains
-
-      // attempt to rename and check for success
-      if (renameat(bctxt->sfd, meta_path, bctxt->sfd, bctxt->filepath) != 0)
-      {
-         LOG(LOG_ERR, "failed to rename meta file \"%s\" to \"%s\" (%s)\n", meta_path, bctxt->filepath, strerror(errno));
-         free(meta_path);
-         return -1;
-      }
-      free(meta_path);
    }
 
    // free state
