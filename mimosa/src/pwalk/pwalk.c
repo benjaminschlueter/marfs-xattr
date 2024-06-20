@@ -3940,6 +3940,9 @@ main(int argc, char *argv[])
 
    // Initialize global mutexes ...
    init_main_mutexes();
+	
+   // Initialize MarFS constructs for MIMOSA
+   mimosa_init(&config, &MP_mutex);
 
    // Create output dir (OUTPUT_DIR), pwalk.log (Plog), and pwalk.fifo ...
    // NOTE: After this, errors all go to Plog rather than stderr ...
