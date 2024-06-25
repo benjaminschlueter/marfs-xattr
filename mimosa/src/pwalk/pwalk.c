@@ -3280,7 +3280,7 @@ dirent_meta_munge: // @@@
                bytes_physical, (Opt_PMODE ? " " : ""), mode_str, curdir_sb.st_nlink,
                (long long) curdir_sb.st_size, REDACT_RelPathDir, ns_stat_s);
          } else if (Cmd_MIMOSA) {
-	     mimosa_convert(AbsPathDir, &curdir_sb, DEST_ARG);
+	     mimosa_convert(RelPathName, &curdir_sb, DEST_ARG);
 	 }
          directory_reported = 1;
       }
@@ -3311,7 +3311,7 @@ dirent_meta_munge: // @@@
          fprintf(WLOG, "<file> %s %u %lld %s%s%s </file>\n",
             (Opt_PMODE ? mode_str : ""), dirent_sb.st_nlink, (long long) dirent_sb.st_size, REDACT_FileName, ns_stat_s, crc_str);
       } else if (Cmd_MIMOSA) {
-      	 mimosa_convert(AbsPathName, &dirent_sb, DEST_ARG);
+      	 mimosa_convert(RelPathName, &dirent_sb, DEST_ARG);
       } else if (Cmd_CMP) {		// -cmp
          if (cmp_target_dir_exists)
             cmp_source_target(w_id, RelPathName, &dirent_sb, cmp_file_result_str);
@@ -3942,7 +3942,7 @@ main(int argc, char *argv[])
    init_main_mutexes();
 	
    // Initialize MarFS constructs for MIMOSA
-   mimosa_init(&config, &MP_mutex);
+   mimosa_main_init(&config, &MP_mutex, DEST_ARG);
 
    // Create output dir (OUTPUT_DIR), pwalk.log (Plog), and pwalk.fifo ...
    // NOTE: After this, errors all go to Plog rather than stderr ...
