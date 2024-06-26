@@ -14,11 +14,11 @@ extern marfs_position* dest_pos;
 
 void mimosa_main_init(marfs_config** config, pthread_mutex_t* mutex, char* dest_path);
 void mimosa_thread_init();
-int mimosa_convert(char* name, struct stat* stat_struct, char* dest);
+int mimosa_convert(char* name, struct stat* stat_struct);
 
 // Internal helper functions
 
-int mimosa_create_file(marfs_position* pos, char* ref_path, char* user_path, FTAG ftag_struct);
+int mimosa_create_file(marfs_position* pos, char* user_path, FTAG ftag_struct);
 FTAG mimosa_generate_ftag();
 marfs_position* dup_pos(marfs_position* src);
 void err(char* err_msg);
